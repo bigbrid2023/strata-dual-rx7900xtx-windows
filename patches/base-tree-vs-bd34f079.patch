@@ -1,0 +1,74 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9964da19..75c237dc 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -795,6 +795,8 @@ endif()
+     endif()
+   endif()
+   if(WIN32 AND STRATA_ENABLE_HIP)
++    # The direct HSA refill backend is Linux-only; Windows uses the existing HIP-copy fallback.
++    target_compile_definitions(strata PRIVATE STRATA_NO_HSA=1)
+     # 0.2.1.2: the ROCm math libraries live in <package>\rocm\bin, which is on PATH only when the launcher starts the engine; load them on first
+     # use (main() adds that folder to the DLL search first) so `strata.exe --version` works from the package folder.  amdhip64_7.dll and the
+     # C++ runtime sit beside the exe (tools/hip/package_windows.py) and stay normal imports.
+diff --git a/include/strata/core/arena_shm.hpp b/include/strata/core/arena_shm.hpp
+index 6b7618ab..5603080d 100644
+--- a/include/strata/core/arena_shm.hpp
++++ b/include/strata/core/arena_shm.hpp
+@@ -62,7 +62,7 @@ private:
+     bool complete_ = false;
+     std::string path_;        // the /dev/shm file, or the keeper's index file
+     bool memfd_ = false;
+-    pid_t keeper_ = 0;
++    int keeper_ = 0;          // keeper pid (Linux pid_t is int; _WIN32 has no pid_t)
+     std::string where_;
+ };
+ 
+diff --git a/src/core/sdma_copy.cpp b/src/core/sdma_copy.cpp
+index 157cf97a..59a035b7 100644
+--- a/src/core/sdma_copy.cpp
++++ b/src/core/sdma_copy.cpp
+@@ -57,6 +57,14 @@ SdmaCopier* SdmaCopier::for_device(int dev, std::string& err) {
+     if (hsa_iterate_agents(collect, &agents) != HSA_STATUS_SUCCESS) return fail("hsa_iterate_agents failed");
+     char bus[64] = {0};
+     if (hipDeviceGetPCIBusId(bus, (int) sizeof(bus), dev) != hipSuccess) return fail("hipDeviceGetPCIBusId failed");
++    // Opt-in PCI allowlist: some host paths cannot complete aggregated SDMA signals.
++    // An excluded device uses the caller's existing HIP-copy fallback.
++    if (const char* allowed = std::getenv("STRATA_HSA_COPY_PCI")) {
++        const std::string list = std::string(",") + allowed + ",";
++        const std::string id = std::string(",") + bus + ",";
++        if (list.find(id) == std::string::npos)
++            return fail(std::string("STRATA_HSA_COPY_PCI excludes ") + bus);
++    }
+     unsigned dom = 0, b = 0, d = 0, f = 0;
+     if (std::sscanf(bus, "%x:%x:%x.%x", &dom, &b, &d, &f) != 4) return fail(std::string("unparsed PCI bus id ") + bus);
+     const uint32_t bdf = (b << 8) | (d << 3) | f;
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index bc461c8a..a130f92f 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -227,6 +227,16 @@ inline bool g_qfuse_hc() {
+ // STRATA_MEGAKERNEL=1 (opt-in): a GDN layer's dense chain (q8_1 quantize, qkv/z GEMVs, conv + a/b, recurrence + norm,
+ // out GEMV) as one persistent kernel instead of six nodes (megakernel_gdn.cu; bitwise the six - mk_gdn_parity)
+ inline bool g_megakernel() { static const bool on = [] { const char* v = std::getenv("STRATA_MEGAKERNEL"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
++// Opt-in dynamic work assignment from the existing megakernel implementation.
++inline bool g_megakernel_dynamic() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_MEGAKERNEL_DYNAMIC");
++        const bool yes = v != nullptr && std::atoi(v) != 0;
++        if (yes) std::fprintf(stderr, "strata verify: STRATA_MEGAKERNEL_DYNAMIC=1 (dynamic work scheduling)\n");
++        return yes;
++    }();
++    return on;
++}
+ // fork 34a35db + b063c13 (Eddoursul), STRATA_SIDE_MIXER=1 / =2: the mixer's work that reads only the layer's input on
+ // branches of the window's graph (bitwise the same outputs); 0 = in line, and no branch stream is created.  Unset: 2 on a
+ // compute capability 12.0 card (sm120_series.hpp; STRATA_SM120_PERF=0 turns it off), 0 elsewhere.
+@@ -1568,6 +1578,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                     a.bo = bo_; a.n_embd = (int) N; a.conv_channels = (int) C; a.value_dim = (int) ZV; a.h_k = (int) HK; a.h_v = (int) HV;
+                     a.eps = EPS; a.counters = mk_counters_; a.stall = m_mk_stall_;
+                     if (q8_attn) a.diag |= 32;   // STRATA_QFUSE: xq_ already holds the input's q8_1 image - no quantize phase
++                    if (g_megakernel_dynamic()) a.diag |= 256;
+                     mk_gdn_dense(a, n, cs);
+                     stamp(l, 2, grp); stamp(l, 3, grp); stamp(l, 4, grp); stamp(l, 5, grp); stamp(l, 6, grp);   // (profile: the kernel lands in stage 2)
+                     il_ready = false;

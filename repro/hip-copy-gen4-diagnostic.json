@@ -1,0 +1,122 @@
+[
+  {
+    "device": 0,
+    "pci_bus": "0000:07:00.0",
+    "source": "pageable",
+    "half": 0,
+    "bytes": 8355840,
+    "2d_mismatch": 0,
+    "first_mismatch": 8355840,
+    "packed_mismatch": 0
+  },
+  {
+    "device": 0,
+    "pci_bus": "0000:07:00.0",
+    "source": "pageable",
+    "half": 1,
+    "bytes": 8355840,
+    "2d_mismatch": 0,
+    "first_mismatch": 8355840,
+    "packed_mismatch": 0
+  },
+  {
+    "device": 0,
+    "pci_bus": "0000:07:00.0",
+    "source": "file-readonly-offset256",
+    "half": 0,
+    "bytes": 8355840,
+    "2d_mismatch": 8323025,
+    "first_mismatch": 0,
+    "packed_mismatch": 0
+  },
+  {
+    "device": 0,
+    "pci_bus": "0000:07:00.0",
+    "source": "file-readonly-offset256",
+    "half": 1,
+    "bytes": 8355840,
+    "2d_mismatch": 8323025,
+    "first_mismatch": 0,
+    "packed_mismatch": 0
+  },
+  {
+    "device": 0,
+    "pci_bus": "0000:07:00.0",
+    "source": "pinned-portable",
+    "half": 0,
+    "bytes": 8355840,
+    "2d_mismatch": 0,
+    "first_mismatch": 8355840,
+    "packed_mismatch": 0
+  },
+  {
+    "device": 0,
+    "pci_bus": "0000:07:00.0",
+    "source": "pinned-portable",
+    "half": 1,
+    "bytes": 8355840,
+    "2d_mismatch": 0,
+    "first_mismatch": 8355840,
+    "packed_mismatch": 0
+  },
+  {
+    "device": 1,
+    "pci_bus": "0000:03:00.0",
+    "source": "pageable",
+    "half": 0,
+    "bytes": 8355840,
+    "2d_mismatch": 0,
+    "first_mismatch": 8355840,
+    "packed_mismatch": 0
+  },
+  {
+    "device": 1,
+    "pci_bus": "0000:03:00.0",
+    "source": "pageable",
+    "half": 1,
+    "bytes": 8355840,
+    "2d_mismatch": 0,
+    "first_mismatch": 8355840,
+    "packed_mismatch": 0
+  },
+  {
+    "device": 1,
+    "pci_bus": "0000:03:00.0",
+    "source": "file-readonly-offset256",
+    "half": 0,
+    "bytes": 8355840,
+    "2d_mismatch": 8323025,
+    "first_mismatch": 0,
+    "packed_mismatch": 0
+  },
+  {
+    "device": 1,
+    "pci_bus": "0000:03:00.0",
+    "source": "file-readonly-offset256",
+    "half": 1,
+    "bytes": 8355840,
+    "2d_mismatch": 8323025,
+    "first_mismatch": 0,
+    "packed_mismatch": 0
+  },
+  {
+    "device": 1,
+    "pci_bus": "0000:03:00.0",
+    "source": "pinned-portable",
+    "half": 0,
+    "bytes": 8355840,
+    "2d_mismatch": 0,
+    "first_mismatch": 8355840,
+    "packed_mismatch": 0
+  },
+  {
+    "device": 1,
+    "pci_bus": "0000:03:00.0",
+    "source": "pinned-portable",
+    "half": 1,
+    "bytes": 8355840,
+    "2d_mismatch": 0,
+    "first_mismatch": 8355840,
+    "packed_mismatch": 0
+  }
+]

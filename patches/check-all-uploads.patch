@@ -1,0 +1,85 @@
+--- a/src/core/tp.cpp
++++ b/src/core/tp.cpp
+@@ -531,22 +531,74 @@
+                 cudaError_t st = cudaSuccess;
+                 if (!cols.empty()) {   // every row's blocks of the column ranges: strided copies from the mapped file
+                     const uint64_t new_row = new_in / (uint64_t) be * (uint64_t) bb;
+-                    uint64_t doff = 0;
+-                    for (const Range& c : cols) {
+-                        const uint64_t w = c.count / (uint64_t) be * (uint64_t) bb, so = c.begin / (uint64_t) be * (uint64_t) bb;
+-                        st = cudaMemcpy2D((uint8_t*) dst + doff, new_row, src + so, row_bytes, w, n_out, cudaMemcpyHostToDevice);
+-                        if (st != cudaSuccess) break;
+-                        doff += w;
++                    const char* pack_env=std::getenv("STRATA_TP_UPLOAD_PACKED");
++                    const char* check_env=std::getenv("STRATA_TP_UPLOAD_CHECK");
++                    const bool packed_upload=pack_env && pack_env[0]=='1';
++                    const bool check_upload=check_env && check_env[0]=='1';
++                    std::vector<uint8_t> packed;
++                    if(packed_upload || check_upload) {
++                        packed.resize(bytes);
++                        uint64_t off=0;
++                        for(uint64_t o=0;o<n_out;++o) for(const Range& c:cols) {
++                            const uint64_t width=c.count/(uint64_t)be*(uint64_t)bb;
++                            std::memcpy(packed.data()+off,src+o*row_bytes+c.begin/(uint64_t)be*(uint64_t)bb,width);
++                            off+=width;
++                        }
++                        if(off!=bytes) {err="tp: packed upload size mismatch";return false;}
++                    }
++                    if(packed_upload) {
++                        st=cudaMemcpy(dst,packed.data(),bytes,cudaMemcpyHostToDevice);
++                    } else {
++                        uint64_t doff = 0;
++                        for (const Range& c : cols) {
++                            const uint64_t w = c.count / (uint64_t) be * (uint64_t) bb, so = c.begin / (uint64_t) be * (uint64_t) bb;
++                            st = cudaMemcpy2D((uint8_t*) dst + doff, new_row, src + so, row_bytes, w, n_out, cudaMemcpyHostToDevice);
++                            if (st != cudaSuccess) break;
++                            doff += w;
++                        }
++                    }
++                    if(check_upload && st==cudaSuccess) {
++                        std::vector<uint8_t> actual(bytes);
++                        st=cudaMemcpy(actual.data(),dst,bytes,cudaMemcpyDeviceToHost);
++                        if(st==cudaSuccess) {
++                            size_t bad=0,first=bytes;
++                            for(size_t j=0;j<bytes;++j) if(actual[j]!=packed[j]) {++bad;if(first==bytes)first=j;}
++                            std::fprintf(stderr,"tp upload check rank%d %s: %zu/%llu bytes differ, first=%zu, packed=%d\n",rank,t.name.c_str(),bad,(unsigned long long)bytes,first,(int)packed_upload);
++                            if(bad) {
++                                std::fprintf(stderr,"tp upload check: expected %u, actual %u at first mismatch\n",(unsigned)packed[first],(unsigned)actual[first]);
++                                err="tp: "+t.name+": column-sliced upload differs from GGUF bytes";return false;
++                            }
++                        }
+                     }
+                 } else {
++                    const char* row_env = std::getenv("STRATA_TP_ROW_PACKED");
++                    const char* check_env = std::getenv("STRATA_TP_UPLOAD_CHECK");
++                    const bool row_packed = row_env && row_env[0] == '1';
++                    const bool check_upload = check_env && check_env[0] == '1';
++                    std::vector<uint8_t> packed;
++                    if (row_packed || check_upload) packed.resize(bytes);
+                     uint64_t off = 0;
+                     for (const Range& rg : rows) {
+                         if (rg.begin + rg.count > n_out) { err = "tp: " + t.name + ": slice past the end"; return false; }
+-                        st = cudaMemcpy((uint8_t*) dst + off, src + rg.begin * row_bytes, rg.count * row_bytes, cudaMemcpyHostToDevice);
++                        const uint64_t size = rg.count * row_bytes;
++                        if (!packed.empty()) std::memcpy(packed.data() + off, src + rg.begin * row_bytes, size);
++                        if (!row_packed) st = cudaMemcpy((uint8_t*) dst + off, src + rg.begin * row_bytes, size, cudaMemcpyHostToDevice);
+                         if (st != cudaSuccess) break;
+-                        off += rg.count * row_bytes;
++                        off += size;
+                     }
+                     if (off != bytes) { err = "tp: " + t.name + ": the slice bytes do not add up"; return false; }
++                    if (row_packed) st = cudaMemcpy(dst, packed.data(), bytes, cudaMemcpyHostToDevice);
++                    if (check_upload && st == cudaSuccess) {
++                        std::vector<uint8_t> actual(bytes);
++                        st = cudaMemcpy(actual.data(), dst, bytes, cudaMemcpyDeviceToHost);
++                        if (st == cudaSuccess) {
++                            size_t bad = 0, first = bytes;
++                            for (size_t j = 0; j < bytes; ++j) if (actual[j] != packed[j]) { ++bad; if (first == bytes) first = j; }
++                            std::fprintf(stderr, "tp row upload check rank%d %s: %zu/%llu bytes differ, first=%zu, packed=%d\n",
++                                         rank, t.name.c_str(), bad, (unsigned long long) bytes, first, (int) row_packed);
++                            if (bad) { err = "tp: " + t.name + ": row-sliced upload differs from GGUF bytes"; return false; }
++                        }
++                    }
+                 }
+                 if (st != cudaSuccess) { err = "tp: " + t.name + ": upload: " + cudaGetErrorString(st); return false; }
+                 r.native_data = dst;

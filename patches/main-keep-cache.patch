@@ -1,0 +1,111 @@
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -6873,6 +6873,9 @@
+ 
+ bool Prefill::dp_wait(int64_t l, int64_t k, std::string& err) {
+     DpLink& L = *dp_link_;
++    // Consecutive chunks assigned to this path already have the preceding state locally.
++    if (k > 0 && (size_t) (k - 1) < dp_plan_.size() && dp_plan_[(size_t) (k - 1)].who == dp_index_)
++        return true;
+     const int peer = 1 - dp_index_;
+     {
+         std::unique_lock<std::mutex> lk(L.mu);
+@@ -6893,6 +6896,11 @@
+     DpLink& L = *dp_link_;
+     const core::ModelGeometry& g = *m.g;
+     const int me = dp_index_;
++    const char* final_env = std::getenv("STRATA_DP_FINAL_PUBLISH");
++    const bool final_only = final_env && final_env[0] == '1' && !dp_plan_.empty() &&
++        std::all_of(dp_plan_.begin(), dp_plan_.end(), [me](const DpChunk& c) { return c.who == me; });
++    // No peer consumes intermediate states when every chunk stays on this device.
++    if (final_only && (size_t) k + 1 < dp_plan_.size()) return true;
+     const int my_dev = m.device, peer_dev = pm.device;
+     int64_t qi = 0, gi = 0;
+     for (int64_t i = 0; i < l; ++i) (core::is_qsa_layer(g, i) ? qi : gi) += 1;
+@@ -6907,7 +6915,8 @@
+         const core::QsaState& a = dp_qsa_of(*m.ss, dp_foreign_, qi);
+         core::QsaState& b = dp_qsa_of(*pm.ss, dp_peer_->dp_foreign_, qi);
+         const int64_t D = g.idx_key_dim, blk = s.idx_block;
+-        const int64_t r0 = std::min<int64_t>(p0 / blk, a.idx_pooled_rows);
++        // The final hand-off includes the full index prefix skipped by earlier chunks.
++        const int64_t r0 = final_only ? 0 : std::min<int64_t>(p0 / blk, a.idx_pooled_rows);
+         const int64_t r1 = std::min<int64_t>((p0 + T) / blk + 2, a.idx_pooled_rows);
+         if (r1 > r0) cp(b.idx_pooled + r0 * D, a.idx_pooled + r0 * D, (size_t) ((r1 - r0) * D) * 4);
+         cp(b.idx_tail, a.idx_tail, (size_t) ((blk - 1) * D) * 4);
+@@ -6943,7 +6952,10 @@
+         err = "prefill DP: the two paths are not linked";
+         return false;
+     }
+-    const int64_t C = std::min({chunk, a.impl_->T, b.impl_->T});   // the current layouts (relayout may be < T_max)
++    const char* main_env = std::getenv("STRATA_DP_MAIN_ONLY");
++    const bool main_only = main_env && main_env[0] == '1';
++    // An idle path keeps its previous layout; its chunk capacity does not constrain main-only work.
++    const int64_t C = main_only ? std::min(chunk, b.impl_->T) : std::min({chunk, a.impl_->T, b.impl_->T});
+     if (pos0 % strata::kernels::qsa_real_shapes().idx_block != 0) {
+         // a continuation from the middle of a K/V block: the owner may hold that block resident (decode's map) and
+         // the other path's append would not reach its slot - the pipeline reads such a prompt
+@@ -6957,7 +6969,9 @@
+     if (step > C) { err = "prefill DP: the plan does not fit the chunk"; return false; }
+     std::vector<DpChunk> plan;
+     for (int64_t c0 = 0; c0 < n; c0 += step) plan.push_back({c0, std::min(step, n - c0), (int64_t) plan.size(), 0});
+-    for (size_t i = 0; i < plan.size(); ++i) plan[i].who = ((plan.size() - 1 - i) % 2 == 0) ? 1 : 0;
++    for (size_t i = 0; i < plan.size(); ++i)
++        plan[i].who = main_only ? 1 : (((plan.size() - 1 - i) % 2 == 0) ? 1 : 0);
++    if (main_only) std::fprintf(stderr, "strata prefill: all DP chunks on CUDA%d; layer state is still published to the other GPU (STRATA_DP_MAIN_ONLY=1)\n", b.impl_->device);
+     if (plan.size() < 2 || plan.back().T < min_last) { err = "prefill DP: the prompt is too short for the plan"; return false; }
+     // per prompt: the plan, each path's residency view (the experts of the layers it does not own are streamed), the
+     // layer range, no stage chaining or per-stage checkpoint parts
+@@ -6993,7 +7007,7 @@
+         }
+     }
+     // [claude] DP share: two chunks (one each), both layouts with its buffers; its help streams live for this prompt
+-    const bool ds = dp_share_env() && plan.size() == 2 && !a.dp_link_->req[0].empty() && a.impl_->ds_own != nullptr &&
++    const bool ds = !main_only && dp_share_env() && plan.size() == 2 && !a.dp_link_->req[0].empty() && a.impl_->ds_own != nullptr &&
+                     b.impl_->ds_own != nullptr && a.impl_->ds_th > 0 && b.impl_->ds_th > 0;
+     for (int i = 0; i < 2 && ds; ++i) {
+         Impl& xm = *P[i]->impl_;
+@@ -7077,7 +7091,8 @@
+         if (P[i]->dp_foreign_) { P[i]->dp_foreign_->ple_prev[0] = prev0[0]; P[i]->dp_foreign_->ple_prev[1] = prev0[1]; }
+     }
+     std::string err_a;
+-    std::future<bool> fa = std::async(std::launch::async, [&] {
++    // The idle path must not run its completion hook: it would precopy state before the main path produces it.
++    std::future<bool> fa = main_only ? std::future<bool>{} : std::async(std::launch::async, [&] {
+         strata::aux_cpus::pin_current_thread();
+         bool r = a.run_impl(tokens, n, pos0, err_a);
+         if (r && a.on_dp_done) {   // its device idle first: nothing of this prompt reads its buffers after this
+@@ -7097,7 +7112,7 @@
+         { std::lock_guard<std::mutex> lk(a.dp_link_->mu); a.dp_link_->abort = true; }
+         a.dp_link_->cv.notify_all();
+     }
+-    const bool ok_a = fa.get();
++    const bool ok_a = main_only ? true : fa.get();
+     for (int i = 0; i < 2; ++i) {   // both paths' streams: every hand-off has landed before decode reads the owners'
+         Prefill& X = *P[i];
+         const core::OnDevice on(X.impl_->device);
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -14451,9 +14451,23 @@
+                     return false;
+                 }
+                 bool any = false;
++                const char* keep_env = std::getenv("STRATA_DP_MAIN_KEEP_CACHE");
++                const char* main_env = std::getenv("STRATA_DP_MAIN_ONLY");
++                // Only skip an idle path's loan when this segment is guaranteed to use main-only DP.
++                // Heads, planned checkpoints, TP prefill and shorter requests retain both original layouts.
++                const bool keep_idle = keep_env && keep_env[0] == '1' && main_env && main_env[0] == '1' &&
++                    o.batch == 0 && pf_plan_chunk <= 0 && resume_plan.chunk <= 0 && sp.plan_chunk(tokens) <= 0 &&
++                    exact <= 0 && !tp_read && dp_on && dp_head(a0) == 0 &&
++                    dp_takes(tokens, o.prefill_chunk);
+                 if (strata::prefill::Prefill::tp_prefill_env()) strata::prefill::Prefill::set_tp_layout(tp_read);
+                 for (PfPart& p : pf_parts) {
+                     if (p.first < 0) continue;
++                    if (keep_idle && p.sp == &sp) {
++                        // Return any earlier segment's loan before keeping this cache resident.
++                        if (!p.lent.empty() && !refill_one(p, e)) return false;
++                        if (trace) std::fprintf(stderr, "strata trace: main-only DP keeps CUDA0's expert cache resident\n");
++                        continue;
++                    }
+                     // [claude] TP prefill: a loan laid out for the other kind of read is laid out again
+                     const bool tp_mismatch = strata::prefill::Prefill::tp_prefill_env() && p.sp->tp_layout_now() != tp_read;
+                     if (!p.lent.empty()) {

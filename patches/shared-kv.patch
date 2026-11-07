@@ -1,0 +1,146 @@
+--- layer-original.cpp
++++ layer-shared-kv.cpp
+@@ -790,8 +790,8 @@
+     return align_up16(n) + 256;
+ }
+ 
+-uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
+-                        const QsaState* share_rope, int64_t ring_cells) {
++uint64_t qsa_state_init_shared_kv(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
++                                  const QsaState* share_rope, int64_t ring_cells, const QsaState* shared_host) {
+     const QsaShapes s = qsa_shapes(g);
+     const KvPlan p = kv_plan(s, max_cells, ring_cells);
+     const int64_t pages = p.pages;
+@@ -902,7 +902,27 @@
+     st.host_step[strata::kernels::kStepCount] = 0;
+     // KV streaming: the authoritative K/V of every cell, pinned and device-mapped, in the identity layout
+     st.host = strata::kernels::KvHostPools{};
+-    if (p.mode != 0) {
++    if (shared_host != nullptr) {
++        // Only DP foreign sessions with the owner's full geometry may borrow this
++        // backing. TP half-head caches have a different layout and never use this.
++        if (p.mode != 1 || ring_cells > 0 || shared_host->kv_mode != p.mode ||
++            shared_host->n_pages != pages || shared_host->max_cells != max_cells ||
++            shared_host->kv_int8 != st.kv_int8 || shared_host->kv_q4 != st.kv_q4 ||
++            shared_host->kv_hybrid != st.kv_hybrid || shared_host->kv_rot != st.kv_rot ||
++            (st.kv_hybrid && (!shared_host->host.k_q || !shared_host->host.k_scale || !shared_host->host.v_q4)) ||
++            (st.kv_q4 && (!shared_host->host.k_q4 || !shared_host->host.v_q4)) ||
++            (st.kv_int8 && (!shared_host->host.k_q || !shared_host->host.v_q ||
++                            !shared_host->host.k_scale || !shared_host->host.v_scale)) ||
++            (!st.kv_hybrid && !st.kv_q4 && !st.kv_int8 &&
++             (!shared_host->host.k_pool || !shared_host->host.v_pool))) {
++            std::fprintf(stderr, "strata: DP shared host KV: incompatible owner\n");
++            return 0;
++        }
++        st.host = shared_host->host;
++        const uint64_t avoided = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
++        std::fprintf(stderr, "strata: DP shared host KV: avoided %llu bytes of unused pinned allocation\n",
++                     (unsigned long long) avoided);
++    } else if (p.mode != 0) {
+         const uint64_t hrows = (uint64_t) pages * s.n_head_kv * s.page_size;
+         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
+         uint8_t* h = nullptr;
+@@ -962,6 +982,11 @@
+     }
+     cudaDeviceSynchronize();
+     return c.used;
++}
++
++uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
++                        const QsaState* share_rope, int64_t ring_cells) {
++    return qsa_state_init_shared_kv(g, max_cells, base, st, share_rope, ring_cells, nullptr);
+ }
+ 
+ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
+--- session-original.cpp
++++ session-shared-kv.cpp
+@@ -31,6 +31,8 @@
+ #endif
+ 
+ namespace strata::core {
++uint64_t qsa_state_init_shared_kv(const ModelGeometry&, int64_t, void*, QsaState&,
++                                  const QsaState*, int64_t, const QsaState*);
+ namespace {
+ 
+ constexpr uint64_t SESSION_STATE_ALIGN = 256;
+@@ -82,8 +84,9 @@
+     return align_up(n, SESSION_STATE_ALIGN) + 4096;
+ }
+ 
+-uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
+-                      int64_t layer_lo, int64_t layer_hi, const QsaState* share_rope) {
++uint64_t session_init_shared_kv(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
++                                int64_t layer_lo, int64_t layer_hi, const QsaState* share_rope,
++                                const SessionState* host_owner) {
+     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
+     if (layer_lo < 0) layer_lo = 0;
+     uint8_t* p = (uint8_t*) base;
+@@ -121,10 +124,20 @@
+     uint8_t* qp = (uint8_t*) s.qsa_state_arena;
+     // a layer whose pinned RAM could not be had (KV streaming's host copy) is half-built: going on would have the
+     // attention read null host pointers at the first request ("illegal memory access"), so the session fails here
+-    for (int64_t j = 0; j < s.qsa_alloc; ++j)
+-        if (qsa_state_init(g, max_cells, qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest),
+-                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? share_rope : &s.qsa_states[s.qsa_ord0]) == 0)
++    if (host_owner != nullptr &&
++        (host_owner->max_cells != max_cells || host_owner->qsa_states == nullptr ||
++         host_owner->qsa_ord0 > s.qsa_ord0 ||
++         host_owner->qsa_ord0 + host_owner->qsa_alloc < s.qsa_ord0 + s.qsa_alloc)) {
++        std::fprintf(stderr, "strata: DP shared host KV: owner session range mismatch\n");
++        return 0;
++    }
++    for (int64_t j = 0; j < s.qsa_alloc; ++j) {
++        const int64_t q = s.qsa_ord0 + j;
++        if (qsa_state_init_shared_kv(g, max_cells, qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest),
++                                    s.qsa_states[q], j == 0 ? share_rope : &s.qsa_states[s.qsa_ord0],
++                                    0, host_owner ? &host_owner->qsa_states[q] : nullptr) == 0)
+             return 0;
++    }
+     qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
+ 
+     s.moe_arena = take(moe_buffers_bytes(g, k));
+@@ -136,6 +149,11 @@
+     s.ple_hist = (float*) take(ple_hist_bytes());
+     s.R = s.block.R;
+     return used;
++}
++
++uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
++                      int64_t layer_lo, int64_t layer_hi, const QsaState* share_rope) {
++    return session_init_shared_kv(g, max_cells, k, base, s, layer_lo, layer_hi, share_rope, nullptr);
+ }
+ 
+ void session_release(SessionState& s) {
+--- generate-original.cpp
++++ generate-shared-kv.cpp
+@@ -43,6 +43,10 @@
+ #include "strata/core/layer.hpp"
+ #include "strata/core/layout.hpp"
+ #include "strata/core/session.hpp"
++namespace strata::core {
++uint64_t session_init_shared_kv(const ModelGeometry&, int64_t, int64_t, void*, SessionState&,
++                                int64_t, int64_t, const QsaState*, const SessionState*);
++}
+ #include "strata/core/weights.hpp"
+ #include "strata/kernels/gfx_arch.hpp"
+ #include "strata/kernels/cpu/expert.hpp"
+@@ -5636,17 +5640,15 @@
+                 std::fprintf(stderr, "strata generate: DP prompt path: CUDA%d's foreign session shares the TP session's %.0f MiB "
+                                      "(STRATA_TP_SHARE_DP)\n", dev, (double) tp_arena_bytes[i] / 1048576.0);
+             }
++            strata::core::SessionState& owner = i == 0 ? st0.ss : ss;
+             if ((!shared && cudaMalloc(&buf, dbytes) != cudaSuccess) ||
+-                strata::core::session_init(g, o.max_context, K, buf, dp_ss[i], lo, hi, rope) == 0) {
++                strata::core::session_init_shared_kv(g, o.max_context, K, buf, dp_ss[i], lo, hi, rope, &owner) == 0) {
+                 std::fprintf(stderr, "strata generate: DP prompt path: CUDA%d's session for layers [%lld, %lld) failed; "
+                                      "DP off\n", dev, (long long) lo, (long long) hi);
+                 cudaGetLastError();
+                 ok = false;
+                 break;
+             }
+-            strata::core::SessionState& owner = i == 0 ? st0.ss : ss;
+-            for (int64_t q = dp_ss[i].qsa_ord0; q < dp_ss[i].qsa_ord0 + dp_ss[i].qsa_alloc; ++q)
+-                dp_ss[i].qsa_states[q].host = owner.qsa_states[q].host;
+             strata::core::session_zero(dp_ss[i], g, nullptr, i == 0 ? main_cs : st0.stream);
+         }
+         if (ok && ss.ple.ready()) {   // the stage's foreign session holds layer 1: its own PLE run
